@@ -144,6 +144,49 @@ function sublog_url_has_blog_base(string $path): bool {
     return (bool) preg_match('#^/' . $base . '(/|$)#i', $path);
 }
 
+/**
+ * True when $url points at site content under the /blog path prefix on the
+ * main domain (e.g. /blog/post or https://example.com/blog/post). Does not
+ * match the blog subdomain host (https://blog.example.com/...), wp-content
+ * assets, or incidental "/blog" substrings in hostnames or plugin paths.
+ */
+function sublog_url_points_at_blog_content(string $url): bool {
+    if ($url === '' || sublog_should_skip_rewrite_url($url)) {
+        return false;
+    }
+
+    $base = sublog_get_blog_base_path();
+
+    if ($url === '/' . $base || str_starts_with($url, '/' . $base . '/')) {
+        return true;
+    }
+
+    $host = wp_parse_url($url, PHP_URL_HOST);
+    $path = wp_parse_url($url, PHP_URL_PATH);
+
+    if (!is_string($host) || !is_string($path)) {
+        return false;
+    }
+
+    $host = strtolower($host);
+
+    if (sublog_strip_www($host) === sublog_get_blog_host()) {
+        return false;
+    }
+
+    $main_hosts = sublog_get_main_hosts();
+    $root = sublog_get_root_domain();
+
+    if (
+        !in_array($host, $main_hosts, true) &&
+        sublog_strip_www($host) !== $root
+    ) {
+        return false;
+    }
+
+    return sublog_url_has_blog_base($path);
+}
+
 function sublog_remove_blog_base_from_path(string $path): string {
     $base = sublog_get_blog_base_regex();
 
@@ -242,7 +285,23 @@ function sublog_is_preview_request(): bool {
     return isset($_GET['preview']) || isset($_GET['preview_id']) || isset($_GET['preview_nonce']);
 }
 
+function sublog_url_has_static_asset_extension(string $url): bool {
+    $path = wp_parse_url($url, PHP_URL_PATH);
+
+    if (!is_string($path) || $path === '') {
+        $path = $url;
+    }
+
+    $path = rtrim(strtolower($path), '/');
+
+    return str_ends_with($path, '.js') || str_ends_with($path, '.css');
+}
+
 function sublog_is_media_or_asset_url(string $url): bool {
+    if (sublog_url_has_static_asset_extension($url)) {
+        return true;
+    }
+
     return (
         str_contains($url, '/wp-content/uploads/') ||
         str_contains($url, '/wp-content/themes/') ||
@@ -338,8 +397,9 @@ function sublog_replace_main_blog_url_with_subdomain(string $url): string {
  * Two passes run on the final HTML:
  *
  * PASS A (every front-end page, main domain and blog subdomain):
- *   Rewrite URLs that clearly point at /blog -> the blog subdomain, so
- *   internal blog links go straight to blog.example.com without a 301 hop.
+ *   Rewrite <a href>, <form action>, and meta content= URLs that point at
+ *   the /blog path on the main domain -> the blog subdomain. <link> stylesheets,
+ *   scripts, and wp-content/wp-includes URLs are never touched.
  *     href="/blog/post/"                    -> https://blog.example.com/post/
  *     href="https://example.com/blog/post/" -> https://blog.example.com/post/
  *
@@ -354,8 +414,8 @@ function sublog_replace_main_blog_url_with_subdomain(string $url): string {
  *     href="/book-online" -> https://example.com/book-online
  *
  * Both passes leave images, scripts, CSS, uploads, and WP system paths
- * alone (src is never touched; /wp-content, /wp-includes, /wp-admin,
- * /wp-json are skipped).
+ * alone (<link href> is never touched; src is never touched; .js/.css and
+ * /wp-content, /wp-includes, /wp-admin, /wp-json are skipped).
  */
 
 add_action('template_redirect', function () {
@@ -390,19 +450,27 @@ function sublog_rewrite_links_in_output(string $html): string {
     }
 
     /**
-     * PASS A: rewrite href/action/content attributes that contain /blog
-     * or /blog/ to the blog subdomain. Runs on every front-end page.
+     * PASS A: rewrite blog content URLs on <a href>, <form action>, and
+     * meta content= only. Never <link rel="stylesheet"> or other asset tags.
      */
     $html = preg_replace_callback(
-        '/\s(href|action|content)=([\'"])([^\'"]*\/blog(?:\/[^\'"]*)?)\2/i',
-        function ($matches) {
-            $attr = $matches[1];
-            $quote = $matches[2];
-            $url = $matches[3];
+        '/(<a\b[^>]*\shref=|<form\b[^>]*\saction=)([\'"])([^\'"]+)\2/i',
+        'sublog_pass_a_rewrite_blog_attribute_callback',
+        $html
+    );
+
+    $html = preg_replace_callback(
+        '/\scontent=([\'"])([^\'"]+)\1/i',
+        function (array $matches): string {
+            $url = $matches[2];
+
+            if (!sublog_url_points_at_blog_content($url)) {
+                return $matches[0];
+            }
 
             $new_url = sublog_rewrite_blog_url_to_subdomain($url);
 
-            return ' ' . $attr . '=' . $quote . esc_url($new_url) . $quote;
+            return ' content=' . $matches[1] . esc_url($new_url) . $matches[1];
         },
         $html
     );
@@ -430,6 +498,18 @@ function sublog_rewrite_links_in_output(string $html): string {
     }
 
     return $html;
+}
+
+function sublog_pass_a_rewrite_blog_attribute_callback(array $matches): string {
+    $url = $matches[3];
+
+    if (!sublog_url_points_at_blog_content($url)) {
+        return $matches[0];
+    }
+
+    $new_url = sublog_rewrite_blog_url_to_subdomain($url);
+
+    return $matches[1] . $matches[2] . esc_url($new_url) . $matches[2];
 }
 
 function sublog_rewrite_root_relative_to_main(string $url): string {
@@ -518,6 +598,10 @@ function sublog_should_skip_rewrite_url(string $url): bool {
         str_starts_with($url, 'data:') ||
         str_starts_with($url, '//')
     ) {
+        return true;
+    }
+
+    if (sublog_url_has_static_asset_extension($url)) {
         return true;
     }
 
